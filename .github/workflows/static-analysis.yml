@@ -1,1 +1,147 @@
+name: NovaNet Static Analysis Worker
 
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "NovaNet Static Analysis Service job_id"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  static-analysis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout worker repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      - name: Install Slither and solc-select
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install slither-analyzer solc-select
+
+      - name: Install Solhint
+        run: |
+          npm install -g solhint
+
+      - name: Confirm tool versions
+        run: |
+          python --version
+          node --version
+          npm --version
+          slither --version || true
+          solhint --version || true
+          solc-select --version || true
+
+      - name: Fetch source from NovaNet Static Analysis Service
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          FETCH_SOURCE_URL: ${{ secrets.NOVANET_FETCH_SOURCE_URL }}
+          WORKER_TOKEN: ${{ secrets.NOVANET_STATIC_ANALYSIS_WORKER_TOKEN }}
+        run: |
+          mkdir -p work/contracts
+
+          curl -sS -X POST "$FETCH_SOURCE_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-NovaNet-Worker-Token: $WORKER_TOKEN" \
+            -d "{\"job_id\":\"$JOB_ID\"}" \
+            -o work/source-response.json
+
+          cat work/source-response.json | jq '{ok, job_id, external_audit_id, contract_name, compiler_version, compiler_semver}'
+
+          OK=$(jq -r '.ok' work/source-response.json)
+          if [ "$OK" != "true" ]; then
+            echo "Source fetch failed"
+            cat work/source-response.json
+            exit 1
+          fi
+
+          jq -r '.source_code' work/source-response.json > work/contracts/Contract.sol
+          jq -r '.compiler_semver // empty' work/source-response.json > work/compiler_semver.txt
+
+          cat > work/.solhint.json <<'EOF'
+          {
+            "extends": "solhint:recommended",
+            "rules": {
+              "compiler-version": "off",
+              "func-visibility": "warn",
+              "not-rely-on-time": "warn",
+              "avoid-low-level-calls": "warn",
+              "no-empty-blocks": "warn"
+            }
+          }
+          EOF
+
+      - name: Select Solidity compiler if possible
+        working-directory: work
+        run: |
+          COMPILER_SEMVER=$(cat compiler_semver.txt | tr -d '\n' || true)
+
+          if [ -n "$COMPILER_SEMVER" ]; then
+            echo "Attempting solc-select install/use $COMPILER_SEMVER"
+            solc-select install "$COMPILER_SEMVER" || true
+            solc-select use "$COMPILER_SEMVER" || true
+          else
+            echo "No compiler semver supplied."
+          fi
+
+          solc --version || true
+
+      - name: Run Slither
+        working-directory: work
+        run: |
+          set +e
+
+          slither contracts/Contract.sol --json slither-report.json > slither.stdout.txt 2> slither.stderr.txt
+          echo $? > slither.exitcode
+
+          if [ ! -f slither-report.json ]; then
+            echo '{"success":false,"error":"Slither did not produce JSON output.","results":{}}' > slither-report.json
+          fi
+
+          echo "Slither exit code:"
+          cat slither.exitcode
+
+      - name: Run Solhint
+        working-directory: work
+        run: |
+          set +e
+
+          solhint "contracts/**/*.sol" -f json > solhint-report.json 2> solhint.stderr.txt
+          echo $? > solhint.exitcode
+
+          if [ ! -s solhint-report.json ]; then
+            solhint "contracts/**/*.sol" > solhint-report.txt 2>> solhint.stderr.txt
+            echo '{}' > solhint-report.json
+          fi
+
+          echo "Solhint exit code:"
+          cat solhint.exitcode
+
+      - name: Submit logs back to NovaNet Static Analysis Service
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          SUBMIT_LOGS_URL: ${{ secrets.NOVANET_SUBMIT_LOGS_URL }}
+          WORKER_TOKEN: ${{ secrets.NOVANET_STATIC_ANALYSIS_WORKER_TOKEN }}
+        run: |
+          python scripts/collect_results.py
